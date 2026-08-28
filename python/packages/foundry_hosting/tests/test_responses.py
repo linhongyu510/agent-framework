@@ -68,6 +68,7 @@ from agent_framework_foundry_hosting import ResponsesHostServer
 from agent_framework_foundry_hosting._responses import (
     CONSENT_ERROR_CODE,
     ConsentError,
+    _container_file_citations_from_function_result,  # pyright: ignore[reportPrivateUsage]
     _item_to_message,  # pyright: ignore[reportPrivateUsage]
     _output_item_to_message,  # pyright: ignore[reportPrivateUsage]
     _OutputItemTracker,  # pyright: ignore[reportPrivateUsage]
@@ -99,6 +100,48 @@ def _make_function_approval_request_content(
         call_id, name, arguments=arguments, additional_properties={"server_label": server_label}
     )
     return Content.from_function_approval_request(request_id, function_call)
+
+
+@pytest.mark.parametrize(
+    "raw_citations",
+    [
+        "not-json",
+        [{"file_id": "cfile_123"}],
+        123,
+    ],
+)
+def test_container_file_citations_ignore_malformed_metadata(raw_citations: Any) -> None:
+    nested_result = Content.from_text(
+        "tool output",
+        additional_properties={
+            "_meta": {
+                "container_id": "cntr_123",
+                "container_file_citations": raw_citations,
+            }
+        },
+    )
+    function_result = Content.from_function_result("call_1", result=[nested_result])
+
+    assert _container_file_citations_from_function_result(function_result) == []
+
+
+def test_container_file_citations_ignore_recursive_json() -> None:
+    nested_result = Content.from_text(
+        "tool output",
+        additional_properties={
+            "_meta": {
+                "container_id": "cntr_123",
+                "container_file_citations": "[]",
+            }
+        },
+    )
+    function_result = Content.from_function_result("call_1", result=[nested_result])
+
+    with patch(
+        "agent_framework_foundry_hosting._responses.json.loads",
+        side_effect=RecursionError,
+    ):
+        assert _container_file_citations_from_function_result(function_result) == []
 
 
 # region Helpers
@@ -166,6 +209,46 @@ def _make_agent(
         agent.run = MagicMock(side_effect=run_streaming)
 
     return agent
+
+
+def _container_file_citation_updates() -> list[AgentResponseUpdate]:
+    file_result = Content.from_text(
+        "Created /mnt/data/result.txt",
+        additional_properties={
+            "_meta": {
+                "container_id": "cntr_123",
+                "container_file_citations": json.dumps([
+                    {
+                        "file_id": "cfile_123",
+                        "filename": "result.txt",
+                        "container_id": "cntr_123",
+                    }
+                ]),
+            }
+        },
+    )
+    return [
+        AgentResponseUpdate(
+            contents=[Content.from_function_call("call_1", "code_interpreter", arguments="{}")],
+            role="assistant",
+            message_id="msg_call",
+        ),
+        AgentResponseUpdate(
+            contents=[Content.from_function_result("call_1", result=[file_result])],
+            role="tool",
+            message_id="msg_result",
+        ),
+        AgentResponseUpdate(
+            contents=[Content.from_text("Preparing the download.")],
+            role="assistant",
+            message_id="msg_preparing",
+        ),
+        AgentResponseUpdate(
+            contents=[Content.from_text("Download result.txt")],
+            role="assistant",
+            message_id="msg_final",
+        ),
+    ]
 
 
 class _RecordingHistoryClient(BaseChatClient):
@@ -1165,6 +1248,98 @@ class TestNonStreaming:
         assert "function_call_output" in types
         assert "message" in types
 
+    async def test_function_result_container_file_citation_is_added_to_output_text(self) -> None:
+        agent = _make_agent(stream_updates=_container_file_citation_updates())
+
+        resp = await _post(_make_server(agent), stream=False)
+
+        assert resp.status_code == 200
+        messages = [item for item in resp.json()["output"] if item["type"] == "message"]
+        assert messages[0]["content"][0]["annotations"] == []
+        output_text = next(
+            part
+            for message in messages
+            for part in message["content"]
+            if part["type"] == "output_text" and part["text"] == "Download result.txt"
+        )
+        assert output_text["annotations"] == [
+            {
+                "type": "container_file_citation",
+                "container_id": "cntr_123",
+                "file_id": "cfile_123",
+                "filename": "result.txt",
+                "start_index": 9,
+                "end_index": 19,
+            },
+        ]
+
+    async def test_pending_same_filename_citations_are_not_globally_replaced(self) -> None:
+        def file_result(container_id: str, file_id: str) -> Content:
+            return Content.from_text(
+                "Created result.txt",
+                additional_properties={
+                    "_meta": {
+                        "container_id": container_id,
+                        "container_file_citations": [
+                            {
+                                "container_id": container_id,
+                                "file_id": file_id,
+                                "filename": "result.txt",
+                            }
+                        ],
+                    }
+                },
+            )
+
+        agent = _make_agent(
+            stream_updates=[
+                AgentResponseUpdate(
+                    contents=[Content.from_function_result("call_1", result=[file_result("cntr_old", "cfile_old")])],
+                    role="tool",
+                ),
+                AgentResponseUpdate(
+                    contents=[Content.from_text("Still working.")],
+                    role="assistant",
+                    message_id="msg_1",
+                ),
+                AgentResponseUpdate(
+                    contents=[Content.from_function_result("call_2", result=[file_result("cntr_new", "cfile_new")])],
+                    role="tool",
+                ),
+                AgentResponseUpdate(
+                    contents=[Content.from_text("Download result.txt")],
+                    role="assistant",
+                    message_id="msg_2",
+                ),
+            ]
+        )
+
+        resp = await _post(_make_server(agent), stream=False)
+
+        final_message = next(
+            item
+            for item in resp.json()["output"]
+            if item["type"] == "message" and item["content"][0].get("text") == "Download result.txt"
+        )
+        assert final_message["content"][0]["annotations"] == [
+            {
+                "type": "container_file_citation",
+                "container_id": "cntr_old",
+                "file_id": "cfile_old",
+                "filename": "result.txt",
+                "start_index": 9,
+                "end_index": 19,
+            },
+            {
+                "type": "container_file_citation",
+                "container_id": "cntr_new",
+                "file_id": "cfile_new",
+                "filename": "result.txt",
+                "start_index": 9,
+                "end_index": 19,
+            },
+        ]
+
     async def test_hosted_mcp_call_and_result_persist_as_single_mcp_call(self) -> None:
         agent = _make_agent(
             response=AgentResponse(
@@ -1348,6 +1523,58 @@ class TestStreaming:
         done_events = [e for e in events if e["event"] == "response.output_text.done"]
         assert len(done_events) == 1
         assert done_events[0]["data"]["text"] == "Hello world!"
+
+    async def test_container_file_citation_is_consistent_across_stream_events(self) -> None:
+        resp = await _post(
+            _make_server(_make_agent(stream_updates=_container_file_citation_updates())),
+            stream=True,
+        )
+
+        assert resp.status_code == 200
+        events = _parse_sse_events(resp.text)
+        expected_annotation = {
+            "type": "container_file_citation",
+            "container_id": "cntr_123",
+            "file_id": "cfile_123",
+            "filename": "result.txt",
+            "start_index": 9,
+            "end_index": 19,
+        }
+
+        annotation_event = next(event for event in events if event["event"] == "response.output_text.annotation.added")
+        assert annotation_event["data"]["annotation"] == expected_annotation
+        annotation_index = events.index(annotation_event)
+        text_done_index = next(
+            index
+            for index, event in enumerate(events)
+            if event["event"] == "response.output_text.done" and event["data"]["text"] == "Download result.txt"
+        )
+        assert annotation_index < text_done_index
+
+        content_done = next(
+            event
+            for event in events
+            if event["event"] == "response.content_part.done"
+            and event["data"]["part"].get("text") == "Download result.txt"
+        )
+        assert content_done["data"]["part"]["annotations"] == [expected_annotation]
+
+        output_done = next(
+            event
+            for event in events
+            if event["event"] == "response.output_item.done"
+            and event["data"]["item"].get("type") == "message"
+            and event["data"]["item"]["content"][0].get("text") == "Download result.txt"
+        )
+        assert output_done["data"]["item"]["content"][0]["annotations"] == [expected_annotation]
+
+        completed = events[-1]["data"]["response"]
+        final_message = next(
+            item
+            for item in completed["output"]
+            if item["type"] == "message" and item["content"][0].get("text") == "Download result.txt"
+        )
+        assert final_message["content"][0]["annotations"] == [expected_annotation]
 
     async def test_usage_is_aggregated_in_completed_response(self, caplog: pytest.LogCaptureFixture) -> None:
         agent = _make_agent(

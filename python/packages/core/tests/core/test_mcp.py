@@ -376,6 +376,32 @@ def test_parse_tool_result_from_mcp_meta_not_in_string():
     assert result[0].text == "Error occurred"
 
 
+def test_parse_tool_result_from_mcp_preserves_per_content_meta():
+    """Test that per-content metadata is merged over result-level metadata."""
+    result_meta = {"source": "result"}
+    content_meta = {
+        "container_id": "cntr_123",
+        "container_file_citations": '[{"file_id":"cfile_123","filename":"result.txt"}]',
+        "source": "content",
+    }
+    mcp_result = types.CallToolResult(
+        content=[
+            types.TextContent(type="text", text="Created result.txt", _meta=content_meta),
+            types.TextContent(type="text", text="Done"),
+        ],
+        _meta=result_meta,
+    )
+
+    result = _HELPER_MCP_TOOL._parse_tool_result_from_mcp(mcp_result)
+
+    assert result[0].additional_properties["_meta"] == {
+        "container_id": "cntr_123",
+        "container_file_citations": '[{"file_id":"cfile_123","filename":"result.txt"}]',
+        "source": "content",
+    }
+    assert result[1].additional_properties["_meta"] == result_meta
+
+
 def test_parse_tool_result_from_mcp_empty_content():
     """Test that empty MCP content normalizes to JSON null text content."""
     mcp_result = types.CallToolResult(content=[])

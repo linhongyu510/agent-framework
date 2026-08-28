@@ -93,6 +93,7 @@ _MCP_NORMALIZED_NAME_KEY = "_mcp_normalized_name"
 _MCP_PROGRESSIVE_LIST_TOOL_NAME = "list_mcp_tools"
 _MCP_PROGRESSIVE_LOAD_TOOL_NAME = "load_tool"
 _MCP_PROGRESSIVE_UNLOAD_TOOL_NAME = "unload_tool"
+
 # Reserved key in an ``additional_tool_argument_names`` mapping that applies its
 # values to every tool on the server rather than a single named tool.
 _MCP_GLOBAL_EXTRA_ARGS_KEY = "*"
@@ -658,10 +659,11 @@ class MCPTool:
     ) -> list[Content]:
         """Parse an MCP CallToolResult into a list of Content items.
 
-        If the server attached a ``_meta`` payload to the tool result (e.g. for
-        Information Flow Control labels under the ``ifc`` key), a copy of that
-        payload is stamped onto each produced :class:`Content` instance under
-        ``additional_properties["_meta"]``.  Downstream layers (such as
+        If the server attached a ``_meta`` payload to the tool result or an
+        individual content item, the merged metadata is stamped onto each
+        produced :class:`Content` instance under ``additional_properties["_meta"]``.
+        Per-content metadata takes precedence over result-level metadata.
+        Downstream layers (such as
         :class:`agent_framework.security.SecureMCPToolProxy`) consume this key
         to derive per-item security labels.
         The sentinel is intentionally generic so any MCP server's ``_meta``
@@ -671,12 +673,14 @@ class MCPTool:
 
         raw_meta = mcp_type.meta
         meta: dict[str, Any] | None = dict(raw_meta) if isinstance(raw_meta, Mapping) else None
-        # Stamp the server ``_meta`` payload directly via additional_properties on
-        # each newly constructed Content; empty when the server provided no meta.
         additional_kwargs: dict[str, Any] = {"additional_properties": {"_meta": meta}} if meta else {}
 
         result: list[Content] = []
         for item in mcp_type.content:
+            raw_item_meta = item.meta
+            item_meta = dict(raw_item_meta) if isinstance(raw_item_meta, Mapping) else None
+            merged_meta = {**(meta or {}), **(item_meta or {})}
+            additional_kwargs = {"additional_properties": {"_meta": merged_meta}} if merged_meta else {}
             match item:
                 case types.TextContent():
                     result.append(Content.from_text(item.text, **additional_kwargs))

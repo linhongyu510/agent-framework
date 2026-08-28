@@ -40,6 +40,7 @@ from azure.ai.agentserver.responses._id_generator import IdGenerator
 from azure.ai.agentserver.responses.aio import ResponseEventStream
 from azure.ai.agentserver.responses.hosting import ResponsesAgentServerHost
 from azure.ai.agentserver.responses.models import (
+    ContainerFileCitationBody,
     CreateResponse,
     FunctionShellAction,
     FunctionShellCallOutputContent,
@@ -82,6 +83,63 @@ from ._state_store import (
 logger = logging.getLogger(__name__)
 
 _HOSTED_RESPONSES_HISTORY_SOURCE_ID = "_foundry_responses_history"
+_MCP_META_KEY = "_meta"
+_CONTAINER_FILE_CITATIONS_KEY = "container_file_citations"
+
+
+@dataclass(frozen=True)
+class _ContainerFileCitation:
+    container_id: str
+    file_id: str
+    filename: str
+
+
+def _container_file_citations_from_function_result(content: Content) -> list[_ContainerFileCitation]:
+    """Extract valid container file citations from nested function result items."""
+    citations: list[_ContainerFileCitation] = []
+    for item in content.items or []:
+        raw_meta = item.additional_properties.get(_MCP_META_KEY)
+        if not isinstance(raw_meta, Mapping):
+            continue
+        meta = cast(Mapping[str, Any], raw_meta)
+
+        raw_citations = meta.get(_CONTAINER_FILE_CITATIONS_KEY)
+        if isinstance(raw_citations, str):
+            try:
+                raw_citations = json.loads(raw_citations)
+            except (json.JSONDecodeError, RecursionError):
+                continue
+
+        if isinstance(raw_citations, Mapping):
+            citation_values: Sequence[Any] = [cast(Mapping[str, Any], raw_citations)]
+        elif isinstance(raw_citations, Sequence) and not isinstance(raw_citations, (str, bytes, bytearray)):
+            citation_values = cast(Sequence[Any], raw_citations)
+        else:
+            continue
+
+        fallback_container_id = meta.get("container_id")
+        for citation in citation_values:
+            if not isinstance(citation, Mapping):
+                continue
+            citation_mapping = cast(Mapping[str, Any], citation)
+            container_id = citation_mapping.get("container_id") or fallback_container_id
+            file_id = citation_mapping.get("file_id")
+            filename = citation_mapping.get("filename")
+            if not isinstance(container_id, str) or not container_id:
+                continue
+            if not isinstance(file_id, str) or not file_id:
+                continue
+            if not isinstance(filename, str) or not filename:
+                continue
+            citations.append(
+                _ContainerFileCitation(
+                    container_id=container_id,
+                    file_id=file_id,
+                    filename=filename,
+                )
+            )
+
+    return citations
 
 
 def _validate_checkpoint_context_id(context_id: str) -> None:
@@ -957,6 +1015,7 @@ class _OutputItemTracker:
         self._fc_builder: OutputItemFunctionCallBuilder | None = None
         self._mcp_builder: OutputItemMcpCallBuilder | None = None
         self._outstanding_function_calls: dict[str, str | None] = {}
+        self._pending_container_file_citations: list[_ContainerFileCitation] = []
 
     @property
     def usage(self) -> ResponseUsage | None:
@@ -1047,6 +1106,7 @@ class _OutputItemTracker:
         elif content.type == "function_result":
             for event in self._close():
                 yield event
+            self._pending_container_file_citations.extend(_container_file_citations_from_function_result(content))
             async for event in self._stream.output_item_function_call_output(
                 content.call_id,  # type: ignore[arg-type]
                 str(content.result or ""),
@@ -1269,9 +1329,46 @@ class _OutputItemTracker:
         accumulated = "".join(self._accumulated)
 
         if self._active_type == "text" and self._text_content and self._message_item:
+            annotations: list[ContainerFileCitationBody] = []
+            unmatched_citations: list[_ContainerFileCitation] = []
+            for citation in self._pending_container_file_citations:
+                start_index = accumulated.find(citation.filename)
+                if start_index < 0:
+                    unmatched_citations.append(citation)
+                    continue
+                annotation = ContainerFileCitationBody(
+                    type="container_file_citation",
+                    container_id=citation.container_id,
+                    file_id=citation.file_id,
+                    filename=citation.filename,
+                    start_index=start_index,
+                    end_index=start_index + len(citation.filename),
+                )
+                annotations.append(annotation)
+                yield self._text_content.emit_annotation_added(annotation)
+            self._pending_container_file_citations = unmatched_citations
             yield self._text_content.emit_text_done(accumulated)
-            yield self._text_content.emit_done()
-            yield self._message_item.emit_done()
+            content_done = self._text_content.emit_done()
+            if annotations:
+                content_done_dict = cast(dict[str, Any], content_done)
+                part = cast(dict[str, Any], content_done_dict["part"])
+                part["annotations"] = annotations
+            yield content_done
+
+            message_done = self._message_item.emit_done()
+            if annotations:
+                message_done_dict = cast(dict[str, Any], message_done)
+                item = cast(dict[str, Any], message_done_dict["item"])
+                content_parts = cast(list[dict[str, Any]], item["content"])
+                content_parts[0]["annotations"] = annotations
+
+                response_output = self._stream.response.get("output")
+                output_index = self._message_item.output_index
+                if isinstance(response_output, list):
+                    output_items = cast(list[Any], response_output)
+                    if output_index < len(output_items):
+                        output_items[output_index] = item
+            yield message_done
             self._text_content = None
             self._message_item = None
 
