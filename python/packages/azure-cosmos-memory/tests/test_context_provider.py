@@ -51,6 +51,7 @@ def mock_memory_client() -> AsyncMock:
     """Create a mock AsyncCosmosMemoryClient."""
     mock_client = AsyncMock()
     mock_client.search_cosmos = AsyncMock(return_value=[])
+    mock_client.build_procedural_context = AsyncMock(return_value="")
     mock_client.get_user_summary = AsyncMock(return_value=None)
     mock_client.upsert_memory = AsyncMock()
     mock_client.create_memory_store = AsyncMock()
@@ -249,7 +250,6 @@ class TestBeforeRun:
         """Searches for memories and injects them into context."""
         mock_memory_client.search_cosmos.return_value = [
             {"content": "User prefers Python", "memory_type": "fact", "confidence": 0.95},
-            {"content": "User completed ML course", "memory_type": "episodic", "confidence": 0.85},
         ]
 
         provider = CosmosMemoryContextProvider(memory_client=mock_memory_client)
@@ -268,17 +268,75 @@ class TestBeforeRun:
         assert call_kwargs["user_id"] == "test-session"
         assert call_kwargs["search_terms"] == "What do you know about me?"
         assert call_kwargs["top_k"] == 5
-        assert call_kwargs["memory_types"] == ["fact", "procedural"]
+        assert call_kwargs["memory_types"] == ["fact"]
+        assert call_kwargs["include_episodes"] is False
         assert call_kwargs["min_confidence"] == 0.7
+        mock_memory_client.build_procedural_context.assert_awaited_once_with(
+            "test-session", task="What do you know about me?"
+        )
 
         # Verify memories added to context
         assert "cosmos_memory" in ctx.context_messages
         added = ctx.context_messages["cosmos_memory"]
         assert len(added) == 1
         assert "User prefers Python" in added[0].text  # type: ignore
-        assert "User completed ML course" in added[0].text  # type: ignore
         assert "0.95" in added[0].text  # type: ignore
-        assert "0.85" in added[0].text  # type: ignore
+
+    async def test_episodic_retrieval_uses_toolkit_opt_in(self, mock_memory_client: AsyncMock) -> None:
+        """Episodic memories use include_episodes so they share the configured top-k budget."""
+        provider = CosmosMemoryContextProvider(
+            memory_client=mock_memory_client,
+            memory_types=["fact", "episodic"],
+        )
+        session = AgentSession(session_id="test-session")
+        ctx = SessionContext(input_messages=[Message(role="user", contents=["Recall my trip"])], session_id="s1")
+
+        await provider.before_run(
+            agent=_STUB_AGENT, session=session, context=ctx, state=session.state.setdefault(provider.source_id, {})
+        )
+
+        call_kwargs = mock_memory_client.search_cosmos.call_args.kwargs
+        assert call_kwargs["memory_types"] == ["fact", "episodic"]
+        assert call_kwargs["include_episodes"] is True
+        mock_memory_client.build_procedural_context.assert_not_awaited()
+
+    async def test_procedural_context_uses_toolkit_compiler(self, mock_memory_client: AsyncMock) -> None:
+        """Procedural memory is compiled through the toolkit and injected as instructions."""
+        mock_memory_client.build_procedural_context.return_value = "Always verify the result."
+        provider = CosmosMemoryContextProvider(
+            memory_client=mock_memory_client,
+            memory_types=["procedural"],
+        )
+        session = AgentSession(session_id="test-session")
+        ctx = SessionContext(input_messages=[Message(role="user", contents=["Run the task"])], session_id="s1")
+
+        await provider.before_run(
+            agent=_STUB_AGENT, session=session, context=ctx, state=session.state.setdefault(provider.source_id, {})
+        )
+
+        mock_memory_client.search_cosmos.assert_not_awaited()
+        mock_memory_client.build_procedural_context.assert_awaited_once_with("test-session", task="Run the task")
+        assert ctx.instructions == ["Always verify the result."]
+
+    async def test_procedural_failure_does_not_block_memory_search(
+        self, mock_memory_client: AsyncMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A procedural-context failure must not suppress fact or episodic retrieval."""
+        mock_memory_client.search_cosmos.return_value = [
+            {"content": "User likes hiking", "memory_type": "fact", "confidence": 0.9}
+        ]
+        mock_memory_client.build_procedural_context.side_effect = Exception("procedure boom")
+        provider = CosmosMemoryContextProvider(memory_client=mock_memory_client)
+        session = AgentSession(session_id="test-session")
+        ctx = SessionContext(input_messages=[Message(role="user", contents=["test"])], session_id="s1")
+
+        await provider.before_run(
+            agent=_STUB_AGENT, session=session, context=ctx, state=session.state.setdefault(provider.source_id, {})
+        )
+
+        assert "Failed to retrieve procedural context" in caplog.text
+        injected = ctx.context_messages[provider.source_id]
+        assert any("User likes hiking" in m.text for m in injected)  # type: ignore[arg-type]
 
     async def test_user_summary_injected_as_untrusted_message(self, mock_memory_client: AsyncMock) -> None:
         """User summary is injected as an untrusted context message, not as agent instructions."""
@@ -566,26 +624,6 @@ class TestAfterRun:
         assert mock_memory_client.upsert_memory.await_count == 1
         call_kwargs = mock_memory_client.upsert_memory.await_args_list[0].kwargs
         assert call_kwargs["content"] == "Trimmed message"
-
-    async def test_falls_back_to_add_cosmos_on_older_toolkit(self) -> None:
-        """Toolkit versions predating the upsert_memory rename still receive turns.
-
-        The declared azure-cosmos-agent-memory range spans both names, so a resolved
-        install can expose either one; picking neither would silently drop every turn.
-        """
-        legacy_client = AsyncMock(spec=["add_cosmos", "search_cosmos", "get_user_summary"])
-        legacy_client.add_cosmos = AsyncMock()
-
-        provider = CosmosMemoryContextProvider(memory_client=legacy_client)
-        session = AgentSession(session_id="test-session")
-        ctx = SessionContext(input_messages=[Message(role="user", contents=["Hello"])], session_id="s1")
-
-        await provider.after_run(
-            agent=_STUB_AGENT, session=session, context=ctx, state=session.state.setdefault(provider.source_id, {})
-        )
-
-        assert legacy_client.add_cosmos.await_count == 1
-        assert legacy_client.add_cosmos.await_args_list[0].kwargs["content"] == "Hello"
 
     async def test_storage_failure_logs_warning(
         self, mock_memory_client: AsyncMock, caplog: pytest.LogCaptureFixture
