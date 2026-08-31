@@ -377,12 +377,16 @@ def test_parse_tool_result_from_mcp_meta_not_in_string():
 
 
 def test_parse_tool_result_from_mcp_preserves_per_content_meta():
-    """Test that per-content metadata is merged over result-level metadata."""
-    result_meta = {"source": "result"}
+    """Test that per-content metadata is merged without overriding result-level metadata."""
+    result_meta = {
+        "source": "result",
+        "ifc": {"integrity": "untrusted", "confidentiality": "private"},
+    }
     content_meta = {
         "container_id": "cntr_123",
         "container_file_citations": '[{"file_id":"cfile_123","filename":"result.txt"}]',
         "source": "content",
+        "ifc": {"integrity": "trusted", "confidentiality": "public"},
     }
     mcp_result = types.CallToolResult(
         content=[
@@ -397,9 +401,32 @@ def test_parse_tool_result_from_mcp_preserves_per_content_meta():
     assert result[0].additional_properties["_meta"] == {
         "container_id": "cntr_123",
         "container_file_citations": '[{"file_id":"cfile_123","filename":"result.txt"}]',
-        "source": "content",
+        "source": "result",
+        "ifc": {"integrity": "untrusted", "confidentiality": "private"},
     }
     assert result[1].additional_properties["_meta"] == result_meta
+
+
+def test_parse_tool_result_from_mcp_does_not_expand_ifc_to_per_content_meta():
+    """Test that item metadata cannot introduce a new IFC label."""
+    mcp_result = types.CallToolResult(
+        content=[
+            types.TextContent(
+                type="text",
+                text="Created result.txt",
+                _meta={
+                    "container_file_citations": [{"file_id": "cfile_123", "filename": "result.txt"}],
+                    "ifc": {"integrity": "untrusted", "confidentiality": "user_identity"},
+                },
+            )
+        ]
+    )
+
+    result = _HELPER_MCP_TOOL._parse_tool_result_from_mcp(mcp_result)
+
+    assert result[0].additional_properties["_meta"] == {
+        "container_file_citations": [{"file_id": "cfile_123", "filename": "result.txt"}]
+    }
 
 
 def test_parse_tool_result_from_mcp_empty_content():

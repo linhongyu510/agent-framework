@@ -3624,7 +3624,13 @@ class TestMCPIFCMetaLabels:
         contents = [
             Content.from_text(
                 "x",
-                additional_properties={"_meta": {"ifc": {"integrity": "untrusted", "confidentiality": "private"}}},
+                additional_properties={
+                    "_meta": {
+                        "ifc": {"integrity": "untrusted", "confidentiality": "private"},
+                        "container_id": "cntr_123",
+                        "container_file_citations": [{"file_id": "cfile_123", "filename": "result.txt"}],
+                    }
+                },
             )
         ]
         _stamp_mcp_content_labels(contents, static)
@@ -3633,8 +3639,12 @@ class TestMCPIFCMetaLabels:
             "integrity": "untrusted",
             "confidentiality": "private",
         }
-        # Sentinel is consumed.
-        assert "_meta" not in contents[0].additional_properties
+        # IFC metadata is consumed, while unrelated metadata remains available
+        # to downstream hosting adapters.
+        assert contents[0].additional_properties["_meta"] == {
+            "container_id": "cntr_123",
+            "container_file_citations": [{"file_id": "cfile_123", "filename": "result.txt"}],
+        }
 
     def test_stamp_contents_missing_meta_falls_back_to_static(self):
         from agent_framework.security import _stamp_mcp_content_labels
@@ -3680,6 +3690,7 @@ class TestMCPIFCMetaLabels:
             "integrity": "untrusted",
             "confidentiality": "public",
         }
+        assert contents[0].additional_properties["_meta"] == {"tracing": {"span": "abc"}}
 
     def test_stamp_contents_multi_item_all_stamped(self):
         from agent_framework.security import _stamp_mcp_content_labels

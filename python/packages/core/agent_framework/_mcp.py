@@ -97,6 +97,17 @@ _MCP_PROGRESSIVE_UNLOAD_TOOL_NAME = "unload_tool"
 # Reserved key in an ``additional_tool_argument_names`` mapping that applies its
 # values to every tool on the server rather than a single named tool.
 _MCP_GLOBAL_EXTRA_ARGS_KEY = "*"
+
+
+def _merge_mcp_meta(
+    result_meta: Mapping[str, Any] | None,
+    item_meta: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge per-item metadata without changing result-level IFC semantics."""
+    item_without_ifc = {key: value for key, value in (item_meta or {}).items() if key != "ifc"}
+    return {**item_without_ifc, **(result_meta or {})}
+
+
 _MCP_META_LABEL_PATTERN = r"[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
 _MCP_META_KEY_PATTERN = re.compile(
     rf"^(?:(?:{_MCP_META_LABEL_PATTERN})(?:\.{_MCP_META_LABEL_PATTERN})*/)?"
@@ -662,7 +673,9 @@ class MCPTool:
         If the server attached a ``_meta`` payload to the tool result or an
         individual content item, the merged metadata is stamped onto each
         produced :class:`Content` instance under ``additional_properties["_meta"]``.
-        Per-content metadata takes precedence over result-level metadata.
+        Result-level metadata retains precedence for overlapping keys. Per-content
+        IFC metadata is not propagated, preserving the existing result-level
+        security-label contract.
         Downstream layers (such as
         :class:`agent_framework.security.SecureMCPToolProxy`) consume this key
         to derive per-item security labels.
@@ -679,7 +692,7 @@ class MCPTool:
         for item in mcp_type.content:
             raw_item_meta = item.meta
             item_meta = dict(raw_item_meta) if isinstance(raw_item_meta, Mapping) else None
-            merged_meta = {**(meta or {}), **(item_meta or {})}
+            merged_meta = _merge_mcp_meta(meta, item_meta)
             additional_kwargs = {"additional_properties": {"_meta": merged_meta}} if merged_meta else {}
             match item:
                 case types.TextContent():

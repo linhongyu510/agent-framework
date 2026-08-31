@@ -1273,7 +1273,7 @@ class TestNonStreaming:
             },
         ]
 
-    async def test_pending_same_filename_citations_are_not_globally_replaced(self) -> None:
+    async def test_latest_pending_citation_replaces_same_filename(self) -> None:
         def file_result(container_id: str, file_id: str) -> Content:
             return Content.from_text(
                 "Created result.txt",
@@ -1322,14 +1322,6 @@ class TestNonStreaming:
             if item["type"] == "message" and item["content"][0].get("text") == "Download result.txt"
         )
         assert final_message["content"][0]["annotations"] == [
-            {
-                "type": "container_file_citation",
-                "container_id": "cntr_old",
-                "file_id": "cfile_old",
-                "filename": "result.txt",
-                "start_index": 9,
-                "end_index": 19,
-            },
             {
                 "type": "container_file_citation",
                 "container_id": "cntr_new",
@@ -1549,7 +1541,7 @@ class TestStreaming:
             for index, event in enumerate(events)
             if event["event"] == "response.output_text.done" and event["data"]["text"] == "Download result.txt"
         )
-        assert annotation_index < text_done_index
+        assert text_done_index < annotation_index
 
         content_done = next(
             event

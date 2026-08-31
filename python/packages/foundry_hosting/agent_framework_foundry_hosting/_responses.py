@@ -1106,7 +1106,10 @@ class _OutputItemTracker:
         elif content.type == "function_result":
             for event in self._close():
                 yield event
-            self._pending_container_file_citations.extend(_container_file_citations_from_function_result(content))
+            pending_by_filename = {citation.filename: citation for citation in self._pending_container_file_citations}
+            for citation in _container_file_citations_from_function_result(content):
+                pending_by_filename[citation.filename] = citation
+            self._pending_container_file_citations = list(pending_by_filename.values())
             async for event in self._stream.output_item_function_call_output(
                 content.call_id,  # type: ignore[arg-type]
                 str(content.result or ""),
@@ -1143,15 +1146,6 @@ class _OutputItemTracker:
             self._active_id = None
             self._accumulated.clear()
             return
-
-        elif content.type == "function_result":
-            for event in self._close():
-                yield event
-            async for event in self._stream.output_item_function_call_output(
-                content.call_id,  # type: ignore[arg-type]
-                str(content.result or ""),
-            ):
-                yield event
 
         elif content.type == "image_generation_tool_result" and content.outputs is not None:
             for event in self._close():
@@ -1345,9 +1339,10 @@ class _OutputItemTracker:
                     end_index=start_index + len(citation.filename),
                 )
                 annotations.append(annotation)
-                yield self._text_content.emit_annotation_added(annotation)
             self._pending_container_file_citations = unmatched_citations
             yield self._text_content.emit_text_done(accumulated)
+            for annotation in annotations:
+                yield self._text_content.emit_annotation_added(annotation)
             content_done = self._text_content.emit_done()
             if annotations:
                 content_done_dict = cast(dict[str, Any], content_done)

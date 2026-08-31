@@ -3259,8 +3259,8 @@ def _stamp_mcp_content_labels(contents: Any, static_label: ContentLabel) -> Any:
     The per-item label is sourced from ``additional_properties["_meta"]``
     (set by :meth:`MCPTool._parse_tool_result_from_mcp`) when the server
     provided a parseable ``ifc`` payload; otherwise ``static_label`` is used.
-    The sentinel ``_meta`` key is consumed (removed) regardless
-    so downstream layers don't re-process it.
+    The ``ifc`` sub-key is consumed after labeling. Other metadata remains
+    available to downstream adapters.
 
     By design the server-supplied label always wins over the static label.
     Composition-time invariants (e.g. confidentiality ceilings on write
@@ -3275,8 +3275,17 @@ def _stamp_mcp_content_labels(contents: Any, static_label: ContentLabel) -> Any:
         if not isinstance(item, Content):
             continue
         props = item.additional_properties or {}
-        server_meta = props.pop(_MCP_RESULT_META_KEY, None)
+        server_meta = props.get(_MCP_RESULT_META_KEY)
         dynamic = _label_from_mcp_meta(server_meta) if server_meta else None
+        if isinstance(server_meta, dict):
+            server_meta_map = cast(dict[str, Any], server_meta)
+            remaining_meta: dict[str, Any] = {key: value for key, value in server_meta_map.items() if key != "ifc"}
+            if remaining_meta:
+                props[_MCP_RESULT_META_KEY] = remaining_meta
+            else:
+                props.pop(_MCP_RESULT_META_KEY, None)
+        else:
+            props.pop(_MCP_RESULT_META_KEY, None)
         label = dynamic or static_label
         props["security_label"] = label.to_dict()
         item.additional_properties = props
